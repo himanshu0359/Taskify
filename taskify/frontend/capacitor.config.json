@@ -1,0 +1,8 @@
+{
+  "appId": "com.taskify.planora",
+  "appName": "Planora",
+  "webDir": "out",
+  "server": {
+    "androidScheme": "https"
+  }
+}
