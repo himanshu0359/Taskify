@@ -2,7 +2,7 @@
 
 import { useEffect, useState, useMemo } from "react";
 import { useRouter } from "next/navigation";
-import { API_URL as API } from "./lib/api";
+import { API_URL as API, authHeaders } from "./lib/api";
 
 const STATUSES = ["To Do", "In Progress", "Completed"];
 const PRIORITIES = ["High", "Medium", "Low"];
@@ -168,7 +168,7 @@ export default function Home() {
     try {
       const loggedInUser = JSON.parse(savedUser);
 
-      if (!loggedInUser?.id) {
+      if (!loggedInUser?.id || !loggedInUser?.token) {
         sessionStorage.removeItem("taskifyLoggedIn");
         router.replace("/login");
         return;
@@ -188,7 +188,7 @@ export default function Home() {
       setLoading(true);
       setMessage("");
 
-      const response = await fetch(`${API}/tasks/${userId}`);
+      const response = await fetch(`${API}/tasks/${userId}`, { headers: authHeaders() });
       const data = await response.json();
 
       if (!response.ok) {
@@ -214,7 +214,7 @@ export default function Home() {
       if (modalMode === "create") {
         const response = await fetch(`${API}/tasks`, {
           method: "POST",
-          headers: { "Content-Type": "application/json" },
+          headers: authHeaders({ "Content-Type": "application/json" }),
           body: JSON.stringify({
             user_id: user.id,
             title: taskTitle.trim(),
@@ -233,7 +233,7 @@ export default function Home() {
         // Edit mode
         const response = await fetch(`${API}/tasks/${currentTaskId}`, {
           method: "PATCH",
-          headers: { "Content-Type": "application/json" },
+          headers: authHeaders({ "Content-Type": "application/json" }),
           body: JSON.stringify({
             title: taskTitle.trim(),
             priority: taskPriority,
@@ -267,6 +267,7 @@ export default function Home() {
 
       const response = await fetch(`${API}/tasks/${taskId}`, {
         method: "DELETE",
+        headers: authHeaders(),
       });
 
       if (!response.ok) {
@@ -288,7 +289,7 @@ export default function Home() {
 
       const response = await fetch(`${API}/tasks/${task.id}`, {
         method: "PATCH",
-        headers: { "Content-Type": "application/json" },
+        headers: authHeaders({ "Content-Type": "application/json" }),
         body: JSON.stringify({ status: newStatus }),
       });
 

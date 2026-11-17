@@ -1,5 +1,9 @@
 import hmac
+import base64
+import hashlib
+import json
 import os
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -31,10 +35,20 @@ def load_local_environment():
 
 load_local_environment()
 
-DATABASE_URL = "sqlite:///./taskify.db"
+DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./taskify.db")
+if DATABASE_URL.startswith("postgres://"):
+    DATABASE_URL = "postgresql+psycopg://" + DATABASE_URL.removeprefix("postgres://")
+elif DATABASE_URL.startswith("postgresql://"):
+    DATABASE_URL = "postgresql+psycopg://" + DATABASE_URL.removeprefix("postgresql://")
+TOKEN_SECRET_VALUE = os.getenv("TASKIFY_SECRET_KEY")
+if os.getenv("APP_ENV") == "production" and not TOKEN_SECRET_VALUE:
+    raise RuntimeError("TASKIFY_SECRET_KEY must be configured in production")
+TOKEN_SECRET = (TOKEN_SECRET_VALUE or "local-development-secret-change-before-deploy").encode()
+TOKEN_TTL_SECONDS = 60 * 60 * 24 * 7
+engine_options = {"connect_args": {"check_same_thread": False}} if DATABASE_URL.startswith("sqlite") else {}
 engine = create_engine(
     DATABASE_URL,
-    connect_args={"check_same_thread": False},
+    **engine_options,
 )
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
@@ -100,6 +114,43 @@ def verify_admin(x_admin_key: Optional[str] = Header(default=None)):
     admin_key = os.getenv("TASKIFY_ADMIN_KEY")
     if not admin_key or not x_admin_key or not hmac.compare_digest(x_admin_key, admin_key):
         raise HTTPException(status_code=403, detail="Admin access denied")
+
+
+def _encode_token(user_id: int) -> str:
+    payload = base64.urlsafe_b64encode(
+        json.dumps({"sub": user_id, "exp": int(time.time()) + TOKEN_TTL_SECONDS}).encode()
+    ).rstrip(b"=")
+    signature = hmac.new(TOKEN_SECRET, payload, hashlib.sha256).digest()
+    return payload.decode() + "." + base64.urlsafe_b64encode(signature).rstrip(b"=").decode()
+
+
+def _decode_token(token: str) -> int:
+    try:
+        payload_part, signature_part = token.split(".", 1)
+        payload = payload_part.encode()
+        signature = base64.urlsafe_b64decode(signature_part + "=" * (-len(signature_part) % 4))
+        expected = hmac.new(TOKEN_SECRET, payload, hashlib.sha256).digest()
+        if not hmac.compare_digest(signature, expected):
+            raise ValueError("Invalid signature")
+        data = json.loads(base64.urlsafe_b64decode(payload + b"=" * (-len(payload) % 4)))
+        if int(data["exp"]) < int(time.time()):
+            raise ValueError("Expired token")
+        return int(data["sub"])
+    except (ValueError, KeyError, TypeError, json.JSONDecodeError):
+        raise HTTPException(status_code=401, detail="Please log in again")
+
+
+def get_current_user(
+    authorization: Optional[str] = Header(default=None),
+    db: Session = Depends(get_db),
+):
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Please log in")
+    user_id = _decode_token(authorization[7:])
+    user = db.query(User).filter(User.id == user_id).first()
+    if not user:
+        raise HTTPException(status_code=401, detail="Please log in again")
+    return user
 
 
 class RegisterRequest(BaseModel):
@@ -184,11 +235,12 @@ def login(data: LoginRequest, db: Session = Depends(get_db)):
     return {
         "message": "Login successful",
         "user": {"id": user.id, "name": user.name, "email": user.email},
+        "token": _encode_token(user.id),
     }
 
 
 @app.post("/tasks", status_code=201)
-def create_task(data: TaskRequest, db: Session = Depends(get_db)):
+def create_task(data: TaskRequest, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
     title = data.title.strip()
     if not title:
         raise HTTPException(status_code=400, detail="Task title is required")
@@ -196,8 +248,8 @@ def create_task(data: TaskRequest, db: Session = Depends(get_db)):
         raise HTTPException(status_code=400, detail="Invalid status")
     if data.priority not in {"High", "Medium", "Low"}:
         raise HTTPException(status_code=400, detail="Invalid priority")
-    if not db.query(User).filter(User.id == data.user_id).first():
-        raise HTTPException(status_code=404, detail="User not found")
+    if data.user_id != user.id:
+        raise HTTPException(status_code=403, detail="You can only manage your own tasks")
 
     task = Task(
         user_id=data.user_id,
@@ -212,7 +264,9 @@ def create_task(data: TaskRequest, db: Session = Depends(get_db)):
 
 
 @app.get("/tasks/{user_id}")
-def get_user_tasks(user_id: int, db: Session = Depends(get_db)):
+def get_user_tasks(user_id: int, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    if user_id != user.id:
+        raise HTTPException(status_code=403, detail="You can only view your own tasks")
     return [
         task_record(task)
         for task in db.query(Task).filter(Task.user_id == user_id).order_by(Task.id).all()
@@ -220,8 +274,8 @@ def get_user_tasks(user_id: int, db: Session = Depends(get_db)):
 
 
 @app.patch("/tasks/{task_id}")
-def update_task(task_id: int, data: TaskUpdate, db: Session = Depends(get_db)):
-    task = db.query(Task).filter(Task.id == task_id).first()
+def update_task(task_id: int, data: TaskUpdate, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    task = db.query(Task).filter(Task.id == task_id, Task.user_id == user.id).first()
     if not task:
         raise HTTPException(status_code=404, detail="Task not found")
     updates = data.model_dump(exclude_unset=True)
@@ -244,8 +298,8 @@ def update_task(task_id: int, data: TaskUpdate, db: Session = Depends(get_db)):
 
 
 @app.delete("/tasks/{task_id}")
-def delete_task(task_id: int, db: Session = Depends(get_db)):
-    task = db.query(Task).filter(Task.id == task_id).first()
+def delete_task(task_id: int, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    task = db.query(Task).filter(Task.id == task_id, Task.user_id == user.id).first()
     if not task:
         raise HTTPException(status_code=404, detail="Task not found")
     db.delete(task)

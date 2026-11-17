@@ -52,6 +52,7 @@ export default function Login() {
           id: loggedInUser.id,
           name: loggedInUser.name || "User",
           email: loggedInUser.email,
+          token: data.token,
         })
       );
 
